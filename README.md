@@ -77,6 +77,14 @@ python scripts/calculate_uncertainty.py \
     --max-iterations 50
 ```
 
+### Arguments
+
+- `run_leiden.py --iterations R`: generate and save `R` clustering runs.
+- `calculate_uncertainty.py --run-counts R1 R2 ...`: calculate InSTability separately for each specified run count. Each value must be no greater than `--max-iterations`.
+- `calculate_uncertainty.py --max-iterations R`: specify how many runs are contained in the saved partition file being loaded. This should match `run_leiden.py --iterations`.
+- `plot.py --iterations R`: plot the result for that run count.
+
+  
 ## Example datasets
 
 The examples use DLPFC samples 151671 and 151673. The original `.h5ad` files
