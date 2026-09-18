@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Calculate spot-level clustering instability from repeated partitions."""
+"""Calculate spot- and sample-level clustering instability."""
 
 from argparse import ArgumentParser
 from pathlib import Path
@@ -15,105 +15,71 @@ SAMPLES = ("151671", "151673")
 def calculate_instability(partitions):
     """Exact instability calculation without an N x N co-association matrix."""
 
-    n_runs = len(partitions)
-    n_spots = len(partitions[0])
+    R = len(partitions)
+    if R < 2:
+        raise ValueError("At least two clustering runs are required.")
+
+    n = len(partitions[0])
 
     # Encode arbitrary cluster labels as compact integers.
     codes = []
     for labels in partitions:
         labels = np.asarray(labels)
-
-        if len(labels) != n_spots:
+        if len(labels) != n:
             raise ValueError("All partitions must contain the same spots.")
+        codes.append(
+            np.unique(labels, return_inverse=True)[1].astype(
+                np.int32, copy=False
+            )
+        )
 
-        _, c = np.unique(labels, return_inverse=True)
-        codes.append(c.astype(np.int32, copy=False))
-
-    # uint32 is sufficient if R * N < 2**32.
-    if n_runs * n_spots >= np.iinfo(np.uint32).max:
+    if R * n >= np.iinfo(np.uint32).max:
         raise ValueError("n_runs * n_spots exceeds uint32 capacity.")
 
-    row_sums_counts = np.zeros(n_spots, dtype=np.uint32)
-    intra_sum_counts = np.zeros(
-        (n_runs, n_spots),
-        dtype=np.uint32,
-    )
+    row_sums = np.zeros(n, dtype=np.uint32)
+    intra_sums = np.zeros((R, n), dtype=np.uint32)
 
-    # --------------------------------------------------------------
-    # Direct exact count calculation: O(R^2 N)
-    # --------------------------------------------------------------
-
-    for q in range(n_runs):
-        cq = codes[q]
-
-        cluster_sizes_q = np.bincount(cq).astype(
-            np.uint32,
-            copy=False,
-        )
-        row_sums_counts += cluster_sizes_q[cq]
-
-        n_q_clusters = len(cluster_sizes_q)
+    # Direct cluster-overlap calculation.
+    for q, cq in enumerate(codes):
+        sizes = np.bincount(cq).astype(np.uint32, copy=False)
+        row_sums += sizes[cq]
+        n_q = len(sizes)
 
         for r in range(q + 1):
             cr = codes[r]
+            n_r = int(cr.max()) + 1
 
-            n_r_clusters = int(cr.max()) + 1
-
-            if (
-                n_r_clusters * n_q_clusters
-                <= np.iinfo(np.int32).max
-            ):
-                pair_key = cr * np.int32(n_q_clusters)
-                pair_key += cq
+            if n_r * n_q <= np.iinfo(np.int32).max:
+                key = cr * np.int32(n_q) + cq
             else:
-                pair_key = cr.astype(np.int64) * n_q_clusters
-                pair_key += cq
+                key = cr.astype(np.int64) * n_q + cq
 
-            pair_counts = np.bincount(pair_key).astype(
-                np.uint32,
-                copy=False,
-            )
+            counts = np.bincount(key).astype(np.uint32, copy=False)
+            contribution = counts[key] - np.uint32(1)
 
-            contribution = pair_counts[pair_key]
-            contribution -= np.uint32(1)
-
-            intra_sum_counts[r] += contribution
-
+            intra_sums[r] += contribution
             if r != q:
-                intra_sum_counts[q] += contribution
+                intra_sums[q] += contribution
 
-    # --------------------------------------------------------------
-    # Instability calculation
-    # --------------------------------------------------------------
+    # LOO-normalized instability.
+    row_sums = row_sums.astype(np.float32)
+    spot_sum = np.zeros(n, dtype=np.float32)
+    loo_factor = np.float32(R / (R - 1))
 
-    row_sums_f = row_sums_counts.astype(np.float32)
-    spot_score_sum = np.zeros(n_spots, dtype=np.float32)
-    global_stability = []
+    for r, labels in enumerate(codes):
+        raw_intra = intra_sums[r].astype(np.float32)
 
-    for run in range(n_runs):
-        labels = codes[run]
+        intra_sum = raw_intra / R
+        inter_sum = (row_sums - raw_intra - R) / R
 
-        intra_sum_f = intra_sum_counts[run].astype(np.float32)
+        sizes = np.bincount(labels).astype(
+            np.uint32, copy=False
+        )[labels]
 
-        intra_sum = intra_sum_f / n_runs
-        inter_sum = (
-            row_sums_f - intra_sum_f - n_runs
-        ) / n_runs
+        intra_count = sizes - np.uint32(1)
+        inter_count = np.uint32(n) - sizes
 
-        cluster_sizes = np.bincount(labels).astype(
-            np.uint32,
-            copy=False,
-        )
-        sizes_per_spot = cluster_sizes[labels]
-
-        valid = sizes_per_spot > 1
-
-        intra_count = sizes_per_spot - np.uint32(1)
-        inter_count = np.uint32(n_spots) - sizes_per_spot
-
-        # Singleton behavior
-        inter_count[~valid] = 0
-
+        # Singleton: mean_intra = 1.
         mean_intra = np.divide(
             intra_sum,
             intra_count,
@@ -121,6 +87,7 @@ def calculate_instability(partitions):
             where=intra_count != 0,
         )
 
+        # Single global cluster: mean_inter = 0.
         mean_inter = np.divide(
             inter_sum,
             inter_count,
@@ -128,38 +95,20 @@ def calculate_instability(partitions):
             where=inter_count != 0,
         )
 
-        spot_score_sum += 1.0 - (mean_intra - mean_inter)
+        spot_sum += (
+            1.0 - (mean_intra - mean_inter)
+        ) * loo_factor
 
-        valid_intra = intra_count > 0
-        valid_inter = inter_count > 0
-
-        if valid_intra.any() and valid_inter.any():
-            mean_intra_global = (
-                intra_sum[valid_intra].sum()
-                / intra_count[valid_intra].sum()
-            )
-
-            mean_inter_global = (
-                inter_sum[valid_inter].sum()
-                / inter_count[valid_inter].sum()
-            )
-
-            global_stability.append(
-                mean_intra_global - mean_inter_global
-            )
-
-    if not global_stability:
-        raise ValueError("No valid intra/inter comparisons found.")
-
-    spot_instability = spot_score_sum / np.float32(n_runs)
-    sample_instability = 1.0 - float(np.mean(global_stability))
+    spot_instability = spot_sum / np.float32(R)
+    sample_instability = float(
+        np.mean(spot_instability, dtype=np.float64)
+    )
 
     return spot_instability, sample_instability
 
 
 def main():
     parser = ArgumentParser()
-
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -180,15 +129,15 @@ def main():
         type=int,
         nargs="+",
         default=[20],
-        help="Numbers of leading runs to use.",
+        help="Numbers of leading clustering runs to use.",
     )
     parser.add_argument(
         "--max-iterations",
         type=int,
         default=20,
     )
-
     args = parser.parse_args()
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     for sample in SAMPLES:
@@ -198,49 +147,38 @@ def main():
               f"{args.max_iterations}iterations.pkl"
         )
 
-        all_partitions = joblib.load(partition_path)
-
+        partitions = joblib.load(partition_path)
         adata = sc.read_h5ad(
             args.data_dir / f"dlpfc_{sample}_filtered.h5ad"
         )
 
-        for n_runs in args.run_counts:
-            if n_runs < 1 or n_runs > len(all_partitions):
+        for R in args.run_counts:
+            if R < 2 or R > len(partitions):
                 raise ValueError(
-                    f"Requested {n_runs} runs, but "
-                    f"{partition_path} contains "
-                    f"{len(all_partitions)}."
+                    f"Requested {R} runs; "
+                    f"{partition_path} contains {len(partitions)}."
                 )
 
             spot, sample_score = calculate_instability(
-                all_partitions[:n_runs]
+                partitions[:R]
             )
-
-            result = {
-                "spot_uncertainty": spot,
-                "uncertainty": sample_score,
-                "iterations": n_runs,
-            }
 
             joblib.dump(
-                result,
+                {
+                    "spot_uncertainty": spot,
+                    "uncertainty": sample_score,
+                    "iterations": R,
+                },
                 args.output_dir
-                / (
-                    f"dlpfc_{sample}_leiden_"
-                    f"uncertainty_{n_runs}runs.pkl"
-                ),
+                / f"dlpfc_{sample}_leiden_uncertainty_{R}runs.pkl",
             )
 
-            adata.obs[
-                f"leiden_uncertainty_{n_runs}runs"
-            ] = spot
-
-            adata.uns[
-                f"leiden_uncertainty_{n_runs}runs"
-            ] = sample_score
+            key = f"leiden_uncertainty_{R}runs"
+            adata.obs[key] = spot
+            adata.uns[key] = sample_score
 
             print(
-                f"{sample}, {n_runs} runs: "
+                f"{sample}, {R} runs: "
                 f"mean instability={sample_score:.4f}"
             )
 
