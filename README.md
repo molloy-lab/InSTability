@@ -4,7 +4,7 @@
 varying only a random seed, and uses the resulting partitions to measure how consistently each spot 
 is grouped with other spots. We quantify spot-level clustering instability across repeated
 spatial transcriptomics clustering runs. Higher scores indicate that a spot's cluster membership is
-less stable across runs.
+less stable across runs. See our [preprint](https://doi.org/10.64898/2026.10.08.738042) for more detailed analysis.
 
 <img src="fig1.png"/>
 
